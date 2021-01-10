@@ -1,0 +1,345 @@
+---
+title: "GIS Assignment"
+author: "Tidong Cao"
+date: "2021/1/8"
+output: html_document
+---
+
+```{r results = FALSE}
+
+library(tidyverse)
+library(tmap)
+library(geojsonio)
+library(plotly)
+library(rgdal)
+library(broom)
+library(mapview)
+library(crosstalk)
+library(sf)
+library(sp)
+library(spdep)
+library(car)
+library(fs)
+library(janitor)
+library(tidypredict)
+library(rsample)
+library(corrr)
+library(spgwr)
+
+
+#Load vector data
+birmsoa <-dir_info(here::here("birmingham_data", 
+                                 "ESRI"))%>%
+  dplyr::filter(str_detect(path, 
+                           "birmingham_MSOA.shp$"))%>%
+  dplyr::select(path)%>%
+  pull()%>%
+  st_read()
+
+#check the data
+qtm(birmsoa)
+
+#set encoding for R process
+Sys.setlocale(category = "LC_ALL", locale = "English_United States.1252")
+#check encoding method
+Sys.getlocale()
+
+#read in some attribute data
+dataset <- read_csv(here::here("birmingham_data", 
+                               "data_test2.csv"),
+                    col_names = TRUE, 
+                    locale = locale(encoding = 'Latin1'))
+#check all of the columns have been read in correctly
+Datatypelist <- dataset %>% 
+  summarise_all(class) %>%
+  pivot_longer(everything(), 
+               names_to="All_variables", 
+               values_to="Variable_class")
+
+Datatypelist
+
+#clean the data
+dataset <- read_csv(here::here("birmingham_data", 
+                               "data_test2.csv"),
+                    na = c("", "NA", "n/a"), 
+                    locale = locale(encoding = 'Latin1'), 
+                    col_names = TRUE)
+Datatypelist <- dataset %>% 
+  summarise_all(class) %>%
+  pivot_longer(everything(), 
+               names_to="All_variables", 
+               values_to="Variable_class")
+
+Datatypelist
+
+#merge boundaries and data
+msoadataset <- birmsoa%>%
+  left_join(.,
+            dataset, 
+            by = c("MSOA11CD" = "MSOA_code"))
+
+#map the dependent variable - obesity
+tmap_mode("view")
+qtm(msoadataset, 
+    fill = "obesity", 
+    borders = NULL,  
+    fill.palette = "Blues")
+
+#check the relationship between independent variables and obesity by drawing the scatter plots
+position <- c(4:16)
+
+Correlation_all<- msoadataset %>%
+  st_drop_geometry()%>%
+  dplyr::select(position)%>%
+  correlate()
+
+rplot(Correlation_all)
+
+#the example of income
+q <- qplot(x = `income`, 
+           y = `obesity`, 
+           data=msoadataset)
+
+q + stat_smooth(method="lm", se=FALSE, size=1) + 
+  geom_jitter()
+
+#data for the model
+Regressiondata<- msoadataset%>%
+  select(obesity,
+         income,
+         quali,
+         employ,
+         unemploy,
+         active,
+         young,
+         old,
+         white,
+         aclimi,
+         badhealth,
+         nocar,
+         morecar,
+         MSOA11CD)
+
+#the model
+model_final <- lm(obesity ~ employ +
+             active +
+               income, data = Regressiondata)
+
+
+summary(model_final)
+
+tidy(model_final)
+
+glance(model_final)
+
+
+##check the assumptions for the model
+
+#First drop the 2 rows containing missing values
+Regressiondata_na <- Regressiondata %>% drop_na()
+
+model_data <- model_final %>%
+  augment(., Regressiondata_na)
+
+#plot residuals
+model_data%>%
+  dplyr::select(.resid)%>%
+  pull()%>%
+  qplot()+ 
+  geom_histogram() 
+#There are some abnormalities, but not serious
+
+#Multicolinearity
+vif(model_final)
+#There may be multicolinearity but it is not seriou.
+
+#Homoscedasticity
+par(mfrow=c(2,2))
+plot(model_final)
+#It looks meet the requirements
+
+#Independence of Errors
+DW <- durbinWatsonTest(model_final)
+tidy(DW)
+
+
+#the DW statistics for our model is 2.18, might some indication of autocorrelation, but perhaps don't need to worry about
+
+
+## check spatial-autocorrelation
+
+
+#some work to address the problem of missing rows
+joined_data <- Regressiondata_na %>%
+  mutate(modelresids = residuals(model_final))
+
+joined <- joined_data %>%
+  select(MSOA11CD, 
+         modelresids) %>%
+  st_drop_geometry()%>%
+  left_join(msoadataset,.,by = 'MSOA11CD' )
+
+#see the distribution of residuals
+tmap_mode("view")
+tm_shape(joined) +
+  tm_polygons("modelresids",
+              palette = "RdYlBu")
+
+
+
+#also to address the problems of missing rows
+
+joined_na <- joined %>% drop_na()
+
+##check the MoranI statistics
+#calculate the centroids
+coordsW <- joined_na%>%
+  st_centroid()%>%
+  st_geometry()
+
+#queen
+LWard_nb <- joined_na %>%
+  poly2nb(., queen=T)
+
+#nearest neighbours
+knn_wards <-coordsW %>%
+  knearneigh(., k=4)
+
+LWard_knn <- knn_wards %>%
+  knn2nb()
+
+
+Lward.queens_weight <- LWard_nb %>%
+  nb2listw(., style="C")
+
+Lward.knn_4_weight <- LWard_knn %>%
+  nb2listw(., style="C")
+
+
+
+Queen <- joined_na %>%
+  st_drop_geometry()%>%
+  dplyr::select(modelresids)%>%
+  pull()%>%
+  moran.test(., Lward.queens_weight)%>%
+  tidy()
+Queen
+
+Nearest_neighbour <- joined_na %>%
+  st_drop_geometry()%>%
+  dplyr::select(modelresids)%>%
+  pull()%>%
+  moran.test(., Lward.knn_4_weight)%>%
+  tidy()
+Nearest_neighbour
+
+model_final_Moran <- joined_na %>%
+  st_drop_geometry()%>%
+  dplyr::select(modelresids)%>%
+  pull()%>%
+  moran.test(., Lward.queens_weight)%>%
+  tidy()
+
+model_final_Moran
+#Moran value shows spatial autocorrelation, but not very significant
+
+
+
+st_crs(joined_na) = 27700
+
+st_crs(coordsW) = 27700
+
+coordsWSP <- coordsW %>%
+  as(., "Spatial")
+
+coordsWSP
+
+joinedSP <- joined_na %>%
+  as(., "Spatial")
+
+
+
+#calculate kernel bandwidth
+GWRbandwidth <- gwr.sel(obesity ~ income + 
+                        active +
+                          employ, 
+                        data = joinedSP, 
+                        coords=coordsWSP,
+                        adapt=T)
+
+gwr.model = gwr(obesity ~ employ + 
+                  income +
+                active, 
+                data = joinedSP, 
+                coords=coordsWSP, 
+                adapt=GWRbandwidth, 
+                hatmatrix=TRUE, 
+                se.fit=TRUE)
+
+#print the results of the model
+gwr.model
+#the R^2 value has a significant rise
+
+results <- as.data.frame(gwr.model$SDF)
+names(results)
+
+#attach coefficients to original SF
+msoadataset_final <- joined_na %>%
+  mutate(coefemploy = results$employ,
+         coefincome = results$income,
+         coefactive = results$active)
+
+
+tm_shape(msoadataset_final) +
+  tm_polygons(col = "coefemploy", 
+              palette = "RdBu", 
+              alpha = 0.5)
+
+#do the sigtest
+sigTest1 = abs(gwr.model$SDF$"employ")-2 * gwr.model$SDF$"employ_se"
+
+
+#store significance results
+msoadataset_final <- msoadataset_final %>%
+  mutate(GWRemploySig = sigTest1)
+
+tm_shape(msoadataset_final) +
+  tm_polygons(col = "GWRemploySig", 
+              palette = "RdYlBu")
+
+
+tm_shape(msoadataset_final) +
+  tm_polygons(col = "coefincome", 
+              palette = "RdBu", 
+              alpha = 0.5)
+
+#do the sigtest
+sigTest2 = abs(gwr.model$SDF$"income")-2 * gwr.model$SDF$"income_se"
+
+
+#store significance results
+msoadataset_final <- msoadataset_final %>%
+  mutate(GWRincomeSig = sigTest2)
+
+tm_shape(msoadataset_final) +
+  tm_polygons(col = "GWRincomeSig", 
+              palette = "RdYlBu")
+
+tm_shape(msoadataset_final) +
+  tm_polygons(col = "coefactive", 
+              palette = "RdBu", 
+              alpha = 0.5)
+
+#do the sigtest
+sigTest3 = abs(gwr.model$SDF$"active")-2 * gwr.model$SDF$"active_se"
+
+
+#store significance results
+msoadataset_final <- msoadataset_final %>%
+  mutate(GWRactiveSig = sigTest3)
+
+tm_shape(msoadataset_final) +
+  tm_polygons(col = "GWRactiveSig", 
+              palette = "RdYlBu")
+```
+
